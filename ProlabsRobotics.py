@@ -1,125 +1,126 @@
-# ───── Standard-library imports ─────────────────────────────────────────────
-import time, platform, webbrowser, urllib.parse, json, os, subprocess
-import pyperclip
-from pynput.mouse     import Controller as Mouse, Button
-from pynput.keyboard  import Controller as Kbd, Key
+import os, json, urllib.parse, sys
+from PySide6.QtWidgets import QApplication
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript
+from PySide6.QtCore import QUrl, QTimer, QEventLoop
 
-# ───── Files ───────────────────────────────────────────────────────────────
-HISTORY_FILE = "convo.json"
-MAX_CONTEXT_TURNS = 50   # only last 50 turns are sent to ChatGPT
+__all__ = ["AI"]
 
-# ───── Controllers ─────────────────────────────────────────────────────────
-MOD   = Key.cmd if platform.system() == "Darwin" else Key.ctrl
-mouse = Mouse(); kbd = Kbd()
+class _SilentPage(QWebEnginePage):
+    def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
+        return
 
-# ───── Helpers ─────────────────────────────────────────────────────────────
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
+class AI:
+    def __init__(self, system_prompt="", history_path="convo.json", poll_ms=800, stability_hits=2, hidden=True):
+        self.system_prompt = system_prompt.strip()
+        self.history_path = history_path
+        self.poll_ms = int(poll_ms)
+        self.stability_hits = max(1, int(stability_hits))
+        self.hidden = bool(hidden)
+        self._app = QApplication.instance() or QApplication(sys.argv)
+        self._browser = QWebEngineView()
+        self._browser.setPage(_SilentPage(self._browser))
+        self._inject_suppress()
+        self._history = self._load_history()
+        self._state = {"mode":"idle","last_saved":"","last_scraped":"","stable":0,"scraping_enabled":False}
+        self._timer = QTimer()
+        self._timer.timeout.connect(self._scrape)
+        self._browser.loadStarted.connect(self._on_load_started)
+        self._browser.loadFinished.connect(self._on_load_finished)
+        if self.hidden:
+            self._browser.resize(1,1)
+            self._browser.showMinimized()
+        else:
+            self._browser.resize(900,700)
+            self._browser.show()
 
-def save_history(history):
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
+    def _inject_suppress(self):
+        s = QWebEngineScript()
+        s.setInjectionPoint(QWebEngineScript.DocumentCreation)
+        s.setRunsOnSubFrames(True)
+        s.setWorldId(QWebEngineScript.MainWorld)
+        s.setSourceCode("console.warn=function(){};console.error=function(){};")
+        self._browser.page().scripts().insert(s)
 
-def focus_back_to_pycharm():
-    system = platform.system()
-    if system == "Darwin":  # macOS
-        subprocess.run(["osascript", "-e", 'tell application "PyCharm" to activate'])
-    elif system == "Windows":
+    def _load_history(self):
+        if not os.path.exists(self.history_path):
+            return []
         try:
-            import pygetwindow as gw
-            for w in gw.getWindowsWithTitle("PyCharm"):
-                w.activate()
-                break
+            return json.load(open(self.history_path))
         except Exception:
-            with kbd.pressed(Key.alt): kbd.press(Key.tab); kbd.release(Key.tab)
-    elif system == "Linux":
-        subprocess.run(["wmctrl", "-a", "PyCharm"])
+            return []
 
-# ───── Main function ───────────────────────────────────────────────────────
-def run(system_prompt: str, user_prompt: str) -> str:
-    history = load_history()
+    def _save_history(self):
+        json.dump(self._history, open(self.history_path,"w"), indent=2)
 
-    # build context with limited history
-    conversation_lines = [system_prompt.strip(), ""]
-    if history:
-        recent_history = history[-MAX_CONTEXT_TURNS:]
-        conversation_lines.append("Here is the most recent conversation history:")
-        for turn in recent_history:
-            role = "User" if turn["role"] == "user" else "Assistant"
-            conversation_lines.append(f"{role}: {turn['content']}")
-        conversation_lines.append("")
-    conversation_lines.append("Now the user asks:")
-    conversation_lines.append(user_prompt.strip())
+    def _compose(self, prompt):
+        b = []
+        if self.system_prompt:
+            b.append(self.system_prompt)
+        b.extend(f"{h['role']}: {h['content']}" for h in self._history[-20:])
+        b.append(f"User: {prompt}")
+        return "\n".join(b)
 
-    combined = "\n".join(conversation_lines)
-    encoded  = urllib.parse.quote(combined, safe="")
-    URL      = f"https://chatgpt.com/?q={encoded}&temporary-chat=true"
+    def _nav(self, prompt):
+        self._history.append({"role":"user","content":prompt})
+        combined = self._compose(prompt)
+        encoded = urllib.parse.quote(combined, safe="")
+        url = f"https://chatgpt.com/?q={encoded}"
+        self._state["last_scraped"] = ""
+        self._state["stable"] = 0
+        self._state["scraping_enabled"] = False
+        self._state["mode"] = "waiting"
+        self._browser.setUrl(QUrl(url))
 
-    # open ChatGPT
-    webbrowser.open(URL)
-    time.sleep(5)
-    mouse.position = (700, 450)
-    time.sleep(0.25)
-    mouse.click(Button.left, 1)
+    def _auto_accept(self):
+        js = """
+        let a=[...document.querySelectorAll("button")].find(b=>b.innerText&&b.innerText.toLowerCase().includes("accept"));if(a)a.click();
+        let c=document.querySelector('[aria-label="Close"]');if(c)c.click();
+        """
+        self._browser.page().runJavaScript(js)
 
-    # clipboard loop
-    start, prev, stable = time.time(), "", 0
-    GENERATING_MARKERS = (
-        "chatgpt is generating",
-        "chatgpt is still generating",
-        "generating a response",
-    )
-    while True:
-        with kbd.pressed(MOD): kbd.press('a'); kbd.release('a')
-        time.sleep(0.15)
-        with kbd.pressed(MOD): kbd.press('c'); kbd.release('c')
-        time.sleep(0.25)
-        clip_now = pyperclip.paste() or ""
-        stable   = stable + 1 if clip_now == prev else 0
-        prev     = clip_now
-        if stable >= 2 and not any(m in clip_now.lower() for m in GENERATING_MARKERS):
-            break
-        if time.time() - start > 90:
-            raise TimeoutError("Timed out waiting for ChatGPT to finish")
-        time.sleep(0.8)
+    def _scrape(self):
+        if not self._state["scraping_enabled"] or self._state["mode"]!="waiting":
+            return
+        js = "var m=document.querySelectorAll('[data-message-author-role=\"assistant\"]');m.length?m[m.length-1].innerText:'';"
+        self._browser.page().runJavaScript(js, self._on_scrape)
 
-    # close tab + refocus
-    with kbd.pressed(MOD): kbd.press('w'); kbd.release('w')
-    time.sleep(0.5)
-    focus_back_to_pycharm()
+    def _on_scrape(self, text):
+        if self._state["mode"]!="waiting":
+            return
+        t = (text or "").strip()
+        if not t:
+            self._state["stable"]=0
+            self._state["last_scraped"]=""
+            return
+        if t==self._state["last_scraped"]:
+            self._state["stable"]+=1
+        else:
+            self._state["last_scraped"]=t
+            self._state["stable"]=1
+        if self._state["stable"]>=self.stability_hits and t!=self._state["last_saved"]:
+            self._state["last_saved"]=t
+            self._history.append({"role":"assistant","content":t})
+            self._save_history()
+            self._state["mode"]="idle"
+            if hasattr(self,"_wait_loop") and isinstance(self._wait_loop,QEventLoop):
+                self._wait_loop.quit()
 
-    # clean response
-    lines = clip_now.splitlines()
-    answer_lines, capture = [], False
-    UNWANTED_PREFIXES = (
-        "Skip to content", "ChatGPT can make mistakes",
-        "No file chosen", "Cookie Preferences",
-        "ChatGPT is generating", "ChatGPT is still generating",
-        "Generating a response",
-    )
-    for ln in lines:
-        stripped, lower = ln.strip(), ln.strip().lower()
-        if lower.startswith("chatgpt said:") or lower.startswith("chatgpt says:"):
-            after = ln.split(":", 1)[1].strip()
-            if after: answer_lines.append(after)
-            capture = True
-            continue
-        if capture and any(lower.startswith(pfx.lower()) for pfx in UNWANTED_PREFIXES):
-            break
-        if capture:
-            answer_lines.append(ln)
+    def _on_load_started(self):
+        self._state["scraping_enabled"]=False
 
-    clean_answer = "\n".join(answer_lines).strip()
+    def _on_load_finished(self, ok):
+        self._state["scraping_enabled"]=True
+        QTimer.singleShot(1200, self._auto_accept)
 
-    # save history
-    history.append({"role": "user", "content": user_prompt})
-    history.append({"role": "assistant", "content": clean_answer})
-    save_history(history)
+    def ask(self, prompt):
+        self._timer.start(self.poll_ms)
+        self._nav(prompt)
+        self._wait_loop = QEventLoop()
+        self._wait_loop.exec()
+        self._timer.stop()
+        return self._state["last_saved"]
 
-    return clean_answer
-
-# ───── Alias ───────────────────────────────────────────────────────────────
-query = run
+    def close(self):
+        self._timer.stop()
+        self._browser.close()
